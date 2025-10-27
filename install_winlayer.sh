@@ -4,6 +4,8 @@ set -euo pipefail
 # ====== Config (editable) =====================================================
 PROTON_GE_VER="GE-Proton10-22"
 PROTON_URL="https://github.com/GloriousEggroll/proton-ge-custom/releases/download/${PROTON_GE_VER}/${PROTON_GE_VER}.tar.gz"
+# Optional checksum (sha256) for the Proton archive. Leave empty to skip verification.
+PROTON_SHA256=""
 
 WINROOT="/Windows"
 RUNNERS_DIR="${WINROOT}/Proton/runners"
@@ -32,6 +34,10 @@ PKGS_I386=(
 )
 PKGS_MISC=(wget tar xdg-utils desktop-file-utils)
 
+# Controls whether the script performs a full "apt-get upgrade".
+# Set to "true" to keep the previous behaviour.
+AUTO_APT_UPGRADE=${AUTO_APT_UPGRADE:-false}
+
 # ====== Utility functions =====================================================
 info()  { printf '\n\033[1;32m==>\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
@@ -43,8 +49,28 @@ need_root() {
   fi
 }
 
+tmp_workdir=""
+
+cleanup_tmp_dir() {
+  if [[ -n "${tmp_workdir}" && -d "${tmp_workdir}" ]]; then
+    rm -rf "${tmp_workdir}"
+  fi
+}
+
 ensure_owner() {
-  chown -R "${WIN_USER_LINUX}:${WIN_USER_LINUX}" "$1"
+  local target="$1"
+
+  if [[ ! -e "${target}" ]]; then
+    return
+  fi
+
+  # Adjust ownership only when necessary to avoid touching pre-existing data.
+  local owner group
+  owner="$(stat -c '%U' "${target}")"
+  group="$(stat -c '%G' "${target}")"
+  if [[ "${owner}" != "${WIN_USER_LINUX}" || "${group}" != "${WIN_USER_LINUX}" ]]; then
+    chown -R "${WIN_USER_LINUX}:${WIN_USER_LINUX}" "${target}"
+  fi
 }
 
 # ====== Pre-flight checks =====================================================
@@ -74,13 +100,26 @@ sudo -u "${WIN_USER_LINUX}" mkdir -p "${WIN_USER_DIR}/AppData"/{Local,Roaming,Te
 info "Downloading Proton-GE ${PROTON_GE_VER} if missing…"
 mkdir -p "${RUNNERS_DIR}"
 if [[ ! -d "${RUNNERS_DIR}/${PROTON_GE_VER}" ]]; then
-  TMP_DIR="$(mktemp -d)"
-  trap 'rm -rf "$TMP_DIR"' EXIT
-  wget -O "${TMP_DIR}/${PROTON_GE_VER}.tar.gz" "${PROTON_URL}"
-  tar -C "${TMP_DIR}" -xvf "${TMP_DIR}/${PROTON_GE_VER}.tar.gz"
+  tmp_workdir="$(mktemp -d)"
+  trap cleanup_tmp_dir EXIT
+  archive_path="${tmp_workdir}/${PROTON_GE_VER}.tar.gz"
+
+  wget -O "${archive_path}" "${PROTON_URL}"
+
+  if [[ -n "${PROTON_SHA256}" ]]; then
+    echo "${PROTON_SHA256}  ${archive_path}" | sha256sum -c - || die "Checksum verification failed for ${PROTON_GE_VER}."
+  else
+    warn "Skipping Proton archive integrity check (PROTON_SHA256 is empty)."
+  fi
+
+  tar -C "${tmp_workdir}" -xvf "${archive_path}"
   # The archive extracts to ${PROTON_GE_VER}
-  mv "${TMP_DIR}/${PROTON_GE_VER}" "${RUNNERS_DIR}/"
+  mv "${tmp_workdir}/${PROTON_GE_VER}" "${RUNNERS_DIR}/"
+  cleanup_tmp_dir
+  trap - EXIT
+  tmp_workdir=""
 fi
+ln -sfn "${RUNNERS_DIR}/${PROTON_GE_VER}" "${RUNNERS_DIR}/current"
 ensure_owner "${RUNNERS_DIR}"
 
 # ====== 3) winrun script ======================================================
@@ -89,15 +128,17 @@ cat > "${WINRUN_PATH}" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROTON_RUNNER=/Windows/Proton/runners/GE-Proton10-22/proton
-FAKE_STEAM=/Windows/Proton/fake-steam
-PREFIX_DIR=/Windows/Proton/system
+PROTON_ROOT=/Windows/Proton
+PROTON_RUNNER="${PROTON_ROOT}/runners/current/proton"
+FAKE_STEAM="${PROTON_ROOT}/fake-steam"
+PREFIX_DIR="${PROTON_ROOT}/system"
 
 # Locale & X11 session
-export LANG=fr_FR.UTF-8
-export LC_ALL=fr_FR.UTF-8
-export DISPLAY=${DISPLAY:-:0}
-export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+if [[ -z "${LANG:-}" ]]; then
+  export LANG=C.UTF-8
+fi
+export DISPLAY="${DISPLAY:-:0}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
 # Proton/Steam environment
 export STEAM_COMPAT_DATA_PATH="$PREFIX_DIR"
@@ -108,13 +149,56 @@ export PROTON_NO_ESYNC=0
 export PROTON_NO_FSYNC=0
 export DXVK_ASYNC=1
 
-# Nautilus may wrap the file path in single quotes; clean and cd into its directory
+# Decode file:// URIs and shell quoting quirks that file managers may add
+sanitize_args() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$@" <<'PY'
+import sys
+import urllib.parse
+
+def clean(arg: str) -> str:
+    if len(arg) >= 2 and arg[0] == arg[-1] and arg[0] in "'\"":
+        arg = arg[1:-1]
+    if arg.startswith("file://"):
+        parsed = urllib.parse.urlparse(arg)
+        if parsed.netloc not in ("", "localhost"):
+            # Fall back to original path for non-local hosts
+            return urllib.parse.unquote(arg)
+        path = urllib.parse.unquote(parsed.path or "/")
+        if not path.startswith("/"):
+            path = "/" + path
+        return path
+    return urllib.parse.unquote(arg)
+
+for item in map(clean, sys.argv[1:]):
+    print(item)
+PY
+  else
+    for arg in "$@"; do
+      local cleaned="$arg"
+      cleaned="${cleaned#\'}"; cleaned="${cleaned%\'}"
+      cleaned="${cleaned#\"}"; cleaned="${cleaned%\"}"
+      printf '%s\n' "$cleaned"
+    done
+  fi
+}
+
 if [[ $# -ge 1 ]]; then
-  CLEAN="$1"
-  CLEAN="${CLEAN#\'}"; CLEAN="${CLEAN%\'}"
-  FILEPATH="$(realpath -- "$CLEAN")"
-  FILEDIR="$(dirname -- "$FILEPATH")"
-  cd "$FILEDIR"
+  mapfile -t CLEAN_ARGS < <(sanitize_args "$@")
+  if [[ ${#CLEAN_ARGS[@]} -ge 1 ]]; then
+    RESOLVED_ARGS=()
+    for entry in "${CLEAN_ARGS[@]}"; do
+      if command -v realpath >/dev/null 2>&1; then
+        if RESOLVED_ENTRY="$(realpath -- "$entry" 2>/dev/null)"; then
+          entry="$RESOLVED_ENTRY"
+        fi
+      fi
+      RESOLVED_ARGS+=("$entry")
+    done
+    set -- "${RESOLVED_ARGS[@]}"
+    FILEDIR="$(dirname -- "${RESOLVED_ARGS[0]}")"
+    cd "$FILEDIR"
+  fi
 fi
 
 exec "$PROTON_RUNNER" run "$@"
@@ -137,7 +221,11 @@ info "Enabling i386 architecture and installing 32-bit dependencies…"
 dpkg --print-foreign-architectures | grep -q '^i386$' || dpkg --add-architecture i386
 apt-get update
 apt-get install -y "${PKGS_I386[@]}"
-apt-get -y upgrade
+if [[ "${AUTO_APT_UPGRADE}" == "true" ]]; then
+  apt-get -y upgrade
+else
+  warn "Skipping full system upgrade (AUTO_APT_UPGRADE=false). Run manually if desired."
+fi
 
 # ====== 6) .desktop + MIME association ========================================
 info "Installing desktop entry and MIME associations…"
@@ -146,9 +234,10 @@ tee "${DESKTOP_SYS}" > /dev/null <<'E0F'
 [Desktop Entry]
 Name=Windows Application
 Comment=Run Windows executables via Proton
-Exec=bash -lc '/usr/local/bin/winrun "%f"'
+Exec=/usr/local/bin/winrun %F
+TryExec=/usr/local/bin/winrun
 Type=Application
-MimeType=application/x-ms-dos-executable;application/x-msdownload;
+MimeType=application/x-ms-dos-executable;application/x-msdownload;application/vnd.microsoft.portable-executable;application/x-msi;
 Icon=application-x-msdownload
 Categories=Utility;
 StartupNotify=true
@@ -163,8 +252,11 @@ chown "${WIN_USER_LINUX}:${WIN_USER_LINUX}" "${DESKTOP_USER}"
 
 # Register MIME associations
 xdg-mime install --novendor "${DESKTOP_SYS}" || true
-xdg-mime default winrun.desktop application/x-ms-dos-executable
-xdg-mime default winrun.desktop application/x-msdownload
+sudo -u "${WIN_USER_LINUX}" xdg-mime install --novendor "${DESKTOP_USER}" || true
+sudo -u "${WIN_USER_LINUX}" xdg-mime default winrun.desktop application/x-ms-dos-executable
+sudo -u "${WIN_USER_LINUX}" xdg-mime default winrun.desktop application/x-msdownload
+sudo -u "${WIN_USER_LINUX}" xdg-mime default winrun.desktop application/vnd.microsoft.portable-executable
+sudo -u "${WIN_USER_LINUX}" xdg-mime default winrun.desktop application/x-msi
 
 # Refresh desktop databases
 sudo -u "${WIN_USER_LINUX}" update-desktop-database "$(dirname "${DESKTOP_USER}")" || true
@@ -184,7 +276,7 @@ Tips:
   Then try double-clicking it in the file manager.
 
 - Optional: configure Proton manually
-      /Windows/Proton/runners/GE-Proton10-22/proton run winecfg
-      /Windows/Proton/runners/GE-Proton10-22/proton run wineboot -i
+      /Windows/Proton/runners/current/proton run winecfg
+      /Windows/Proton/runners/current/proton run wineboot -i
 
 TIP

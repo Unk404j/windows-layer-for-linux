@@ -25,13 +25,15 @@ It uses the same compatibility stack as Steam Play (Proton GE) but runs complete
 ## 1 – Create the Windows-like Directory Structure
 
 ```bash
+WIN_USER=${SUDO_USER:-$USER}
+
 sudo mkdir -p /Windows/Proton/{runners,fake-steam,system/pfx/dosdevices}
 sudo mkdir -p /Windows/drive_c/{Program\ Files,Program\ Files\ \(x86\),Users}
-sudo chown -R $USER:$USER /Windows
+sudo chown -R "$WIN_USER:$WIN_USER" /Windows
 
 # Link Linux home directory as Windows user
-sudo ln -s /home/julien /Windows/drive_c/Users/julien
-mkdir -p /Windows/drive_c/Users/julien/AppData/{Local,Roaming,Temp}
+sudo ln -s "/home/${WIN_USER}" "/Windows/drive_c/Users/${WIN_USER}"
+sudo -u "$WIN_USER" mkdir -p "/Windows/drive_c/Users/${WIN_USER}/AppData"/{Local,Roaming,Temp}
 ```
 
 ---
@@ -40,8 +42,15 @@ mkdir -p /Windows/drive_c/Users/julien/AppData/{Local,Roaming,Temp}
 
 ```bash
 wget https://github.com/GloriousEggroll/proton-ge-custom/releases/download/GE-Proton10-22/GE-Proton10-22.tar.gz
+
+# Optional but recommended: verify the archive (replace <sha256> with the value from GitHub).
+echo "<sha256>  GE-Proton10-22.tar.gz" | sha256sum -c -
+
 tar -xvf GE-Proton10-22.tar.gz
 rm GE-Proton10-22.tar.gz
+
+# Create/refresh a stable pointer to the active Proton runner
+ln -sfn /Windows/Proton/runners/GE-Proton10-22 /Windows/Proton/runners/current
 ```
 
 ---
@@ -56,9 +65,9 @@ export STEAM_COMPAT_CLIENT_INSTALL_PATH=/Windows/Proton/fake-steam
 To configure Proton manually:
 
 ```bash
-/Windows/Proton/runners/GE-Proton10-22/proton run winecfg
+/Windows/Proton/runners/current/proton run winecfg
 # or
-/Windows/Proton/runners/GE-Proton10-22/proton run wineboot -i
+/Windows/Proton/runners/current/proton run wineboot -i
 ```
 
 ---
@@ -73,14 +82,18 @@ Paste:
 
 ```bash
 #!/bin/bash
-PROTON_RUNNER=/Windows/Proton/runners/GE-Proton10-22/proton
-FAKE_STEAM=/Windows/Proton/fake-steam
-PREFIX_DIR=/Windows/Proton/system
+set -euo pipefail
 
-export LANG=fr_FR.UTF-8
-export LC_ALL=fr_FR.UTF-8
-export DISPLAY=${DISPLAY:-:0}
-export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+PROTON_ROOT=/Windows/Proton
+PROTON_RUNNER="${PROTON_ROOT}/runners/current/proton"
+FAKE_STEAM="${PROTON_ROOT}/fake-steam"
+PREFIX_DIR="${PROTON_ROOT}/system"
+
+if [[ -z "${LANG:-}" ]]; then
+    export LANG=C.UTF-8
+fi
+export DISPLAY="${DISPLAY:-:0}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export STEAM_COMPAT_DATA_PATH="$PREFIX_DIR"
 export STEAM_COMPAT_CLIENT_INSTALL_PATH="$FAKE_STEAM"
 export PROTON_NO_ESYNC=0
@@ -88,14 +101,14 @@ export PROTON_NO_FSYNC=0
 export DXVK_ASYNC=1
 
 # Clean Nautilus-provided path and change directory
-if [ -n "$1" ]; then
+if [[ -n "$1" ]]; then
     FILEPATH=$(echo "$1" | sed "s/^'//;s/'$//")
-    FILEPATH=$(realpath "$FILEPATH")
-    FILEDIR=$(dirname "$FILEPATH")
+    FILEPATH=$(realpath -- "$FILEPATH")
+    FILEDIR=$(dirname -- "$FILEPATH")
     cd "$FILEDIR" || exit 1
 fi
 
-"$PROTON_RUNNER" run "$@"
+exec "$PROTON_RUNNER" run "$@"
 ```
 
 Then make it executable:
@@ -153,7 +166,9 @@ sudo apt install -y wine32:i386
 # Optional: additional graphics runtimes
 sudo apt install -y libdrm2:i386 libxcb1:i386 libxcomposite1:i386 libxinerama1:i386 libxcursor1:i386
 
-sudo apt update && sudo apt upgrade -y
+sudo apt update
+# Optional: perform a full upgrade once you reviewed the changes
+# sudo apt upgrade -y
 ```
 
 ---
@@ -165,9 +180,10 @@ sudo tee /usr/share/applications/winrun.desktop > /dev/null << 'E0F'
 [Desktop Entry]
 Name=Windows Application
 Comment=Run Windows executables via Proton
-Exec=bash -lc '/usr/local/bin/winrun "%f"'
+Exec=/usr/local/bin/winrun %F
+TryExec=/usr/local/bin/winrun
 Type=Application
-MimeType=application/x-ms-dos-executable;application/x-msdownload;
+MimeType=application/x-ms-dos-executable;application/x-msdownload;application/vnd.microsoft.portable-executable;application/x-msi;
 Icon=application-x-msdownload
 Categories=Utility;
 StartupNotify=true
@@ -186,6 +202,9 @@ xdg-mime default winrun.desktop application/x-msdownload
 mkdir -p ~/.local/share/applications
 cp /usr/share/applications/winrun.desktop ~/.local/share/applications/
 chmod +x ~/.local/share/applications/winrun.desktop
+xdg-mime install --novendor ~/.local/share/applications/winrun.desktop
+xdg-mime default winrun.desktop application/vnd.microsoft.portable-executable
+xdg-mime default winrun.desktop application/x-msi
 update-desktop-database ~/.local/share/applications/
 sudo update-desktop-database /usr/share/applications/
 ```
@@ -194,9 +213,9 @@ sudo update-desktop-database /usr/share/applications/
 
 ## 8 – Usage
 
-* **Double-click** any `.exe` → launches automatically via Proton-GE.
+* **Double-click** any `.exe` → launches automatically via Proton-GE, even if the file keeps its executable bit.
 * **Right-click → Open With → Windows Application** also works.
-* The `bash -lc` wrapper ensures a full login environment, avoiding missing variables like `$DISPLAY` or `$XDG_RUNTIME_DIR`.
+* Paths with spaces, accents, parentheses, or `file://` URIs are cleaned automatically before Proton runs.
 
 ---
 
@@ -204,17 +223,37 @@ sudo update-desktop-database /usr/share/applications/
 
 If nothing happens when double-clicking an `.exe`:
 
-1. Ensure the file is **not executable** as a native binary:
+1. Confirm that `winrun.desktop` is listed as the default handler:
 
    ```bash
-   chmod -x file.exe
+   xdg-mime query default application/x-ms-dos-executable
+   xdg-mime query default application/x-msdownload
    ```
+   Both commands should return `winrun.desktop`. If not, rerun the MIME registration commands above **as your desktop user**.
 2. Check logs with:
 
    ```bash
    journalctl --user -f
    ```
-3. Verify that `bash -lc` exists in your `.desktop` entry.
+3. Inspect `/usr/local/bin/winrun` and ensure it is executable (`chmod +x /usr/local/bin/winrun`).
+
+---
+
+## Uninstall / Cleanup
+
+To remove the layer completely:
+
+```bash
+sudo rm -f /usr/share/applications/winrun.desktop
+rm -f ~/.local/share/applications/winrun.desktop
+sudo rm -f /usr/local/bin/winrun
+sudo rm -rf /Windows
+sed -i '/winrun.desktop/d' ~/.config/mimeapps.list 2>/dev/null || true
+sudo update-desktop-database /usr/share/applications 2>/dev/null || true
+update-desktop-database ~/.local/share/applications 2>/dev/null || true
+```
+
+This removes the launcher, MIME associations, and Proton files so `.exe` files revert to the desktop’s default handler.
 
 ---
 

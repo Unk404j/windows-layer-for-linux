@@ -9,13 +9,15 @@
 ### 1. Création de l’arborescence système Windows simulée
 
 ```bash
+WIN_USER=${SUDO_USER:-$USER}
+
 sudo mkdir -p /Windows/Proton/{runners,fake-steam,system/pfx/dosdevices}
 sudo mkdir -p /Windows/drive_c/{Program\ Files,Program\ Files\ \(x86\),Users}
-sudo chown -R $USER:$USER /Windows
+sudo chown -R "$WIN_USER:$WIN_USER" /Windows
 
 # Lien symbolique de l’utilisateur Windows vers le compte Linux
-sudo ln -s /home/julien /Windows/drive_c/Users/julien
-mkdir -p /Windows/drive_c/Users/julien/AppData/{Local,Roaming,Temp}
+sudo ln -s "/home/${WIN_USER}" "/Windows/drive_c/Users/${WIN_USER}"
+sudo -u "$WIN_USER" mkdir -p "/Windows/drive_c/Users/${WIN_USER}/AppData"/{Local,Roaming,Temp}
 ```
 
 ---
@@ -24,8 +26,15 @@ mkdir -p /Windows/drive_c/Users/julien/AppData/{Local,Roaming,Temp}
 
 ```bash
 wget https://github.com/GloriousEggroll/proton-ge-custom/releases/download/GE-Proton10-22/GE-Proton10-22.tar.gz
+
+# Optionnel mais recommandé : vérifier l’archive (remplacez <sha256> par la valeur officielle).
+echo "<sha256>  GE-Proton10-22.tar.gz" | sha256sum -c -
+
 tar -xvf GE-Proton10-22.tar.gz
 rm GE-Proton10-22.tar.gz
+
+# Créer/mettre à jour un lien stable vers le runner actif
+ln -sfn /Windows/Proton/runners/GE-Proton10-22 /Windows/Proton/runners/current
 ```
 
 ---
@@ -40,9 +49,9 @@ export STEAM_COMPAT_CLIENT_INSTALL_PATH=/Windows/Proton/fake-steam
 Configuration possible (au choix) :
 
 ```bash
-/Windows/Proton/runners/GE-Proton10-22/proton run winecfg
+/Windows/Proton/runners/current/proton run winecfg
 # ou
-/Windows/Proton/runners/GE-Proton10-22/proton run wineboot -i
+/Windows/Proton/runners/current/proton run wineboot -i
 ```
 
 ---
@@ -59,14 +68,18 @@ Contenu :
 
 ```bash
 #!/bin/bash
-PROTON_RUNNER=/Windows/Proton/runners/GE-Proton10-22/proton
-FAKE_STEAM=/Windows/Proton/fake-steam
-PREFIX_DIR=/Windows/Proton/system
+set -euo pipefail
 
-export LANG=fr_FR.UTF-8
-export LC_ALL=fr_FR.UTF-8
-export DISPLAY=${DISPLAY:-:0}
-export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+PROTON_ROOT=/Windows/Proton
+PROTON_RUNNER="${PROTON_ROOT}/runners/current/proton"
+FAKE_STEAM="${PROTON_ROOT}/fake-steam"
+PREFIX_DIR="${PROTON_ROOT}/system"
+
+if [[ -z "${LANG:-}" ]]; then
+    export LANG=C.UTF-8
+fi
+export DISPLAY="${DISPLAY:-:0}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export STEAM_COMPAT_DATA_PATH="$PREFIX_DIR"
 export STEAM_COMPAT_CLIENT_INSTALL_PATH="$FAKE_STEAM"
 export PROTON_NO_ESYNC=0
@@ -74,14 +87,14 @@ export PROTON_NO_FSYNC=0
 export DXVK_ASYNC=1
 
 # Nettoyage du chemin envoyé par Nautilus
-if [ -n "$1" ]; then
+if [[ -n "$1" ]]; then
     FILEPATH=$(echo "$1" | sed "s/^'//;s/'$//")
-    FILEPATH=$(realpath "$FILEPATH")
-    FILEDIR=$(dirname "$FILEPATH")
+    FILEPATH=$(realpath -- "$FILEPATH")
+    FILEDIR=$(dirname -- "$FILEPATH")
     cd "$FILEDIR" || exit 1
 fi
 
-"$PROTON_RUNNER" run "$@"
+exec "$PROTON_RUNNER" run "$@"
 ```
 
 Rendre le script exécutable :
@@ -140,7 +153,9 @@ sudo apt install -y wine32:i386
 sudo apt install -y libdrm2:i386 libxcb1:i386 libxcomposite1:i386 libxinerama1:i386 libxcursor1:i386
 
 # Mise à jour finale
-sudo apt update && sudo apt upgrade -y
+sudo apt update
+# Optionnel : lancer la mise à niveau complète après revue des paquets
+# sudo apt upgrade -y
 ```
 
 ---
@@ -154,9 +169,10 @@ sudo tee /usr/share/applications/winrun.desktop > /dev/null << 'E0F'
 [Desktop Entry]
 Name=Windows Application
 Comment=Run Windows executables via Proton
-Exec=bash -lc '/usr/local/bin/winrun "%f"'
+Exec=/usr/local/bin/winrun %F
+TryExec=/usr/local/bin/winrun
 Type=Application
-MimeType=application/x-ms-dos-executable;application/x-msdownload;
+MimeType=application/x-ms-dos-executable;application/x-msdownload;application/vnd.microsoft.portable-executable;application/x-msi;
 Icon=application-x-msdownload
 Categories=Utility;
 StartupNotify=true
@@ -175,6 +191,9 @@ xdg-mime default winrun.desktop application/x-msdownload
 mkdir -p ~/.local/share/applications
 cp /usr/share/applications/winrun.desktop ~/.local/share/applications/
 chmod +x ~/.local/share/applications/winrun.desktop
+xdg-mime install --novendor ~/.local/share/applications/winrun.desktop
+xdg-mime default winrun.desktop application/vnd.microsoft.portable-executable
+xdg-mime default winrun.desktop application/x-msi
 update-desktop-database ~/.local/share/applications/
 sudo update-desktop-database /usr/share/applications/
 ```
@@ -183,8 +202,24 @@ sudo update-desktop-database /usr/share/applications/
 
 ### 8. Utilisation
 
-* **Double-clique** sur n’importe quel `.exe` → il se lancera automatiquement via Proton-GE.
-* **Clic droit → Ouvrir avec** fonctionne aussi.
-* Le script passe par `bash -lc` pour bénéficier d’un environnement complet (évite les erreurs d’affichage ou de cache de polices).
+* **Double-cliquez** sur n’importe quel `.exe` → lancement automatique via Proton-GE, même si le fichier conserve son bit exécutable.
+* **Clic droit → Ouvrir avec → Windows Application** fonctionne aussi.
+* Les chemins comportant espaces, accents, parenthèses ou des URI `file://` sont nettoyés automatiquement avant l’exécution.
+
+---
+
+### 9. Désinstallation / nettoyage
+
+```bash
+sudo rm -f /usr/share/applications/winrun.desktop
+rm -f ~/.local/share/applications/winrun.desktop
+sudo rm -f /usr/local/bin/winrun
+sudo rm -rf /Windows
+sed -i '/winrun.desktop/d' ~/.config/mimeapps.list 2>/dev/null || true
+sudo update-desktop-database /usr/share/applications 2>/dev/null || true
+update-desktop-database ~/.local/share/applications 2>/dev/null || true
+```
+
+Ces commandes retirent Proton, le lanceur et les associations `.exe` pour revenir au comportement initial de votre environnement de bureau.
 
 ---
